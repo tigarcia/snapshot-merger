@@ -92,7 +92,7 @@ mod tests {
         accounts.insert(keypair.pubkey(), account);
 
         // Adding accounts should not fail
-        let result = functions::add_accounts(&bank, &accounts);
+        let result = functions::add_accounts(&bank, &accounts, "test");
         assert!(result.is_ok());
     }
 }

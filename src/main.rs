@@ -10,10 +10,8 @@
 use {
     clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg},
     log::*,
-    solana_account::{AccountSharedData, WritableAccount},
     solana_accounts_db::{
         accounts_db::AccountsDbConfig,
-        accounts_index::ScanConfig,
         hardened_unpack::open_genesis_config,
     },
     solana_clock::Slot,
@@ -24,7 +22,6 @@ use {
         blockstore_options::{AccessType, BlockstoreOptions},
         blockstore_processor::ProcessOptions,
     },
-    solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank,
         snapshot_archive_info::SnapshotArchiveInfoGetter,
@@ -32,15 +29,13 @@ use {
         snapshot_config::{SnapshotConfig, SnapshotUsage},
         snapshot_utils::{ArchiveFormat, SnapshotVersion, ZstdConfig},
     },
-    solana_stake_program,
-    solana_vote_program,
     std::{
-        collections::HashMap,
         path::{Path, PathBuf},
         process::exit,
         sync::Arc,
     },
 };
+use snapshot_merger::merge::functions;
 
 #[derive(Debug)]
 struct MergeStats {
@@ -113,88 +108,6 @@ fn load_bank_from_snapshot(
     Ok(bank)
 }
 
-fn extract_vote_accounts(bank: &Bank) -> Result<HashMap<Pubkey, AccountSharedData>, String> {
-    info!("Extracting vote accounts...");
-    let vote_program_id = solana_vote_program::id();
-
-    let accounts = bank
-        .get_program_accounts(&vote_program_id, &ScanConfig::default())
-        .map_err(|e| format!("Failed to get vote accounts: {:?}", e))?;
-
-    info!("Found {} vote accounts", accounts.len());
-    Ok(accounts.into_iter().collect())
-}
-
-fn extract_stake_accounts(bank: &Bank) -> Result<HashMap<Pubkey, AccountSharedData>, String> {
-    info!("Extracting stake accounts...");
-    let stake_program_id = solana_stake_program::id();
-
-    let accounts = bank
-        .get_program_accounts(&stake_program_id, &ScanConfig::default())
-        .map_err(|e| format!("Failed to get stake accounts: {:?}", e))?;
-
-    info!("Found {} stake accounts", accounts.len());
-    Ok(accounts.into_iter().collect())
-}
-
-fn remove_vote_accounts(bank: &Bank) -> Result<usize, String> {
-    info!("Removing vote accounts from mainnet bank...");
-    let vote_program_id = solana_vote_program::id();
-
-    let accounts = bank
-        .get_program_accounts(&vote_program_id, &ScanConfig::default())
-        .map_err(|e| format!("Failed to get vote accounts: {:?}", e))?;
-
-    let count = accounts.len();
-    for (pubkey, mut account) in accounts {
-        account.set_lamports(0);
-        bank.store_account(&pubkey, &account);
-    }
-
-    info!("Removed {} vote accounts", count);
-    Ok(count)
-}
-
-fn remove_stake_accounts(bank: &Bank) -> Result<usize, String> {
-    info!("Removing stake accounts from mainnet bank...");
-    let stake_program_id = solana_stake_program::id();
-
-    let accounts = bank
-        .get_program_accounts(&stake_program_id, &ScanConfig::default())
-        .map_err(|e| format!("Failed to get stake accounts: {:?}", e))?;
-
-    let count = accounts.len();
-    for (pubkey, mut account) in accounts {
-        account.set_lamports(0);
-        bank.store_account(&pubkey, &account);
-    }
-
-    info!("Removed {} stake accounts", count);
-    Ok(count)
-}
-
-fn add_accounts(
-    bank: &Bank,
-    accounts: &HashMap<Pubkey, AccountSharedData>,
-    account_type: &str,
-) -> Result<(), String> {
-    info!("Adding {} {} accounts to merged bank...", accounts.len(), account_type);
-
-    for (pubkey, account) in accounts {
-        bank.store_account(pubkey, account);
-    }
-
-    info!("Added {} {} accounts", accounts.len(), account_type);
-    Ok(())
-}
-
-fn count_total_accounts(bank: &Bank) -> Result<usize, String> {
-    let mut count = 0;
-    bank.scan_all_accounts(|_| { count += 1; }, true)
-        .map_err(|e| format!("Failed to scan accounts: {:?}", e))?;
-    Ok(count)
-}
-
 fn create_snapshot_from_bank(
     bank: &Bank,
     output_dir: &Path,
@@ -253,7 +166,7 @@ fn merge_snapshots(
     // Load mainnet snapshot
     info!("\n=== Step 2: Loading Mainnet Snapshot ===");
     let mainnet_bank = load_bank_from_snapshot(mainnet_ledger, &genesis_config)?;
-    let mainnet_total_accounts = count_total_accounts(&mainnet_bank)?;
+    let mainnet_total_accounts = functions::count_total_accounts(&mainnet_bank)?;
     info!("Mainnet bank loaded with {} total accounts", mainnet_total_accounts);
 
     // Load snapshot to merge (with its own genesis - we just need the accounts)
@@ -264,8 +177,8 @@ fn merge_snapshots(
 
     // Extract vote and stake accounts from ledger to merge
     info!("\n=== Step 4: Extracting Validators to Merge ===");
-    let merge_vote_accounts = extract_vote_accounts(&merge_bank)?;
-    let merge_stake_accounts = extract_stake_accounts(&merge_bank)?;
+    let merge_vote_accounts = functions::extract_vote_accounts(&merge_bank)?;
+    let merge_stake_accounts = functions::extract_stake_accounts(&merge_bank)?;
 
     // Create child bank from mainnet for modifications
     info!("\n=== Step 5: Creating Child Bank for Modifications ===");
@@ -280,13 +193,13 @@ fn merge_snapshots(
 
     // Remove mainnet vote and stake accounts
     info!("\n=== Step 6: Removing Mainnet Validators ===");
-    let mainnet_vote_accounts_removed = remove_vote_accounts(&merged_bank)?;
-    let mainnet_stake_accounts_removed = remove_stake_accounts(&merged_bank)?;
+    let mainnet_vote_accounts_removed = functions::remove_vote_accounts(&merged_bank)?;
+    let mainnet_stake_accounts_removed = functions::remove_stake_accounts(&merged_bank)?;
 
     // Add vote and stake accounts from ledger to merge
     info!("\n=== Step 7: Adding Validators from Ledger to Merge ===");
-    add_accounts(&merged_bank, &merge_vote_accounts, "vote")?;
-    add_accounts(&merged_bank, &merge_stake_accounts, "stake")?;
+    functions::add_accounts(&merged_bank, &merge_vote_accounts, "vote")?;
+    functions::add_accounts(&merged_bank, &merge_stake_accounts, "stake")?;
 
     // Recalculate capitalization
     info!("\n=== Step 8: Recalculating Capitalization ===");
@@ -317,7 +230,7 @@ fn merge_snapshots(
         Arc::new(merged_bank)
     };
 
-    let final_total_accounts = count_total_accounts(&final_bank)?;
+    let final_total_accounts = functions::count_total_accounts(&final_bank)?;
 
     // Create snapshot
     info!("\n=== Step 10: Creating Merged Snapshot ===");
