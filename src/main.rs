@@ -1,11 +1,11 @@
-// Snapshot Merger - Merge mainnet-beta snapshot with custom cluster validators
+// Snapshot Merger - Merge mainnet-beta snapshot with validators from another ledger
 //
 // This tool merges two Solana snapshots:
 // - Takes all accounts from mainnet-beta snapshot
 // - Removes all vote and stake accounts from mainnet
-// - Adds all vote and stake accounts from custom cluster
+// - Adds all vote and stake accounts from the ledger to merge
 //
-// Result: Mainnet state with custom cluster's validators
+// Result: Mainnet state with validators from the ledger to merge
 
 use {
     clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg},
@@ -47,8 +47,8 @@ struct MergeStats {
     mainnet_total_accounts: usize,
     mainnet_vote_accounts_removed: usize,
     mainnet_stake_accounts_removed: usize,
-    tim_vote_accounts_added: usize,
-    tim_stake_accounts_added: usize,
+    merge_vote_accounts_added: usize,
+    merge_stake_accounts_added: usize,
     final_total_accounts: usize,
     capitalization_before: u64,
     capitalization_after: u64,
@@ -235,13 +235,13 @@ fn create_snapshot_from_bank(
 
 fn merge_snapshots(
     mainnet_ledger: &Path,
-    tim_cluster_ledger: &Path,
+    ledger_to_merge: &Path,
     output_snapshot_dir: &Path,
     warp_slot: Option<Slot>,
 ) -> Result<MergeStats, String> {
     info!("=== Starting Snapshot Merge ===");
     info!("Mainnet ledger: {:?}", mainnet_ledger);
-    info!("Tim cluster ledger: {:?}", tim_cluster_ledger);
+    info!("Ledger to merge: {:?}", ledger_to_merge);
     info!("Output directory: {:?}", output_snapshot_dir);
 
     // Load genesis config from mainnet (we want mainnet's genesis)
@@ -256,16 +256,16 @@ fn merge_snapshots(
     let mainnet_total_accounts = count_total_accounts(&mainnet_bank)?;
     info!("Mainnet bank loaded with {} total accounts", mainnet_total_accounts);
 
-    // Load tim cluster snapshot (with its own genesis - we just need the accounts)
-    info!("\n=== Step 3: Loading Tim Cluster Snapshot ===");
-    let tim_genesis_config = open_genesis_config(tim_cluster_ledger, 10485760)
-        .map_err(|e| format!("Failed to open tim cluster genesis config: {:?}", e))?;
-    let tim_cluster_bank = load_bank_from_snapshot(tim_cluster_ledger, &tim_genesis_config)?;
+    // Load snapshot to merge (with its own genesis - we just need the accounts)
+    info!("\n=== Step 3: Loading Ledger to Merge ===");
+    let merge_genesis_config = open_genesis_config(ledger_to_merge, 10485760)
+        .map_err(|e| format!("Failed to open ledger genesis config: {:?}", e))?;
+    let merge_bank = load_bank_from_snapshot(ledger_to_merge, &merge_genesis_config)?;
 
-    // Extract vote and stake accounts from tim cluster
-    info!("\n=== Step 4: Extracting Tim Cluster Validators ===");
-    let tim_vote_accounts = extract_vote_accounts(&tim_cluster_bank)?;
-    let tim_stake_accounts = extract_stake_accounts(&tim_cluster_bank)?;
+    // Extract vote and stake accounts from ledger to merge
+    info!("\n=== Step 4: Extracting Validators to Merge ===");
+    let merge_vote_accounts = extract_vote_accounts(&merge_bank)?;
+    let merge_stake_accounts = extract_stake_accounts(&merge_bank)?;
 
     // Create child bank from mainnet for modifications
     info!("\n=== Step 5: Creating Child Bank for Modifications ===");
@@ -283,10 +283,10 @@ fn merge_snapshots(
     let mainnet_vote_accounts_removed = remove_vote_accounts(&merged_bank)?;
     let mainnet_stake_accounts_removed = remove_stake_accounts(&merged_bank)?;
 
-    // Add tim cluster vote and stake accounts
-    info!("\n=== Step 7: Adding Tim Cluster Validators ===");
-    add_accounts(&merged_bank, &tim_vote_accounts, "vote")?;
-    add_accounts(&merged_bank, &tim_stake_accounts, "stake")?;
+    // Add vote and stake accounts from ledger to merge
+    info!("\n=== Step 7: Adding Validators from Ledger to Merge ===");
+    add_accounts(&merged_bank, &merge_vote_accounts, "vote")?;
+    add_accounts(&merged_bank, &merge_stake_accounts, "stake")?;
 
     // Recalculate capitalization
     info!("\n=== Step 8: Recalculating Capitalization ===");
@@ -330,8 +330,8 @@ fn merge_snapshots(
         mainnet_total_accounts,
         mainnet_vote_accounts_removed,
         mainnet_stake_accounts_removed,
-        tim_vote_accounts_added: tim_vote_accounts.len(),
-        tim_stake_accounts_added: tim_stake_accounts.len(),
+        merge_vote_accounts_added: merge_vote_accounts.len(),
+        merge_stake_accounts_added: merge_stake_accounts.len(),
         final_total_accounts,
         capitalization_before,
         capitalization_after,
@@ -343,8 +343,8 @@ fn merge_snapshots(
     info!("  Mainnet total accounts: {}", stats.mainnet_total_accounts);
     info!("  Mainnet vote accounts removed: {}", stats.mainnet_vote_accounts_removed);
     info!("  Mainnet stake accounts removed: {}", stats.mainnet_stake_accounts_removed);
-    info!("  Tim cluster vote accounts added: {}", stats.tim_vote_accounts_added);
-    info!("  Tim cluster stake accounts added: {}", stats.tim_stake_accounts_added);
+    info!("  Vote accounts added from ledger to merge: {}", stats.merge_vote_accounts_added);
+    info!("  Stake accounts added from ledger to merge: {}", stats.merge_stake_accounts_added);
     info!("  Final total accounts: {}", stats.final_total_accounts);
     info!("  Capitalization before: {} lamports", stats.capitalization_before);
     info!("  Capitalization after: {} lamports", stats.capitalization_after);
@@ -369,12 +369,12 @@ fn main() {
                 .help("Path to mainnet-beta ledger directory"),
         )
         .arg(
-            Arg::with_name("tim_cluster_ledger")
-                .long("tim-cluster-ledger")
+            Arg::with_name("ledger_to_merge")
+                .long("ledger-to-merge")
                 .value_name("PATH")
                 .takes_value(true)
                 .required(true)
-                .help("Path to tim cluster ledger directory"),
+                .help("Path to ledger directory whose validators should be merged"),
         )
         .arg(
             Arg::with_name("output_directory")
@@ -395,11 +395,11 @@ fn main() {
         .get_matches();
 
     let mainnet_ledger = PathBuf::from(value_t_or_exit!(matches, "mainnet_ledger", String));
-    let tim_cluster_ledger = PathBuf::from(value_t_or_exit!(matches, "tim_cluster_ledger", String));
+    let ledger_to_merge = PathBuf::from(value_t_or_exit!(matches, "ledger_to_merge", String));
     let output_directory = PathBuf::from(value_t_or_exit!(matches, "output_directory", String));
     let warp_slot = value_t!(matches, "warp_slot", Slot).ok();
 
-    match merge_snapshots(&mainnet_ledger, &tim_cluster_ledger, &output_directory, warp_slot) {
+    match merge_snapshots(&mainnet_ledger, &ledger_to_merge, &output_directory, warp_slot) {
         Ok(stats) => {
             println!("\n✅ Snapshot merge completed successfully!");
             println!("\nSummary:");
@@ -407,9 +407,9 @@ fn main() {
             println!("  • Removed {} vote accounts and {} stake accounts from mainnet",
                      stats.mainnet_vote_accounts_removed,
                      stats.mainnet_stake_accounts_removed);
-            println!("  • Added {} vote accounts and {} stake accounts from tim cluster",
-                     stats.tim_vote_accounts_added,
-                     stats.tim_stake_accounts_added);
+            println!("  • Added {} vote accounts and {} stake accounts from ledger to merge",
+                     stats.merge_vote_accounts_added,
+                     stats.merge_stake_accounts_added);
             println!("  • Final snapshot has {} accounts", stats.final_total_accounts);
             println!("  • Capitalization: {} -> {} lamports",
                      stats.capitalization_before,
