@@ -3,6 +3,10 @@ name = "snapshot-merger"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "snapshot_merger"
+path = "src/lib.rs"
+
 [[bin]]
 name = "snapshot-merger"
 path = "src/main.rs"
@@ -17,7 +21,9 @@ solana-account = "3.0"
 solana-accounts-db = "3.0"
 solana-clock = "3.0"
 solana-genesis-config = "3.0"
+solana-keypair = "3.0"
 solana-ledger = { version = "3.0", features = ["dev-context-only-utils"] }
+solana-signer = "3.0"
 solana-pubkey = "3.0"
 solana-runtime = { version = "3.0", features = ["dev-context-only-utils"] }
 solana-sdk = "3.0"
