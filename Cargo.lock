@@ -4580,9 +4580,12 @@ dependencies = [
 name = "snapshot-merger"
 version = "0.1.0"
 dependencies = [
+ "base64 0.21.7",
+ "bincode",
  "clap",
  "env_logger",
  "log",
+ "serde_json",
  "solana-account",
  "solana-accounts-db",
  "solana-clock",

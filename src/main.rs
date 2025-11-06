@@ -1,11 +1,11 @@
-// Snapshot Merger - Merge mainnet-beta snapshot with validators from another ledger
+// Snapshot Merger - Merge mainnet state into another ledger's snapshot
 //
 // This tool merges two Solana snapshots:
-// - Takes all accounts from mainnet-beta snapshot
-// - Removes all vote and stake accounts from mainnet
-// - Adds all vote and stake accounts from the ledger to merge
+// - Starts with the ledger-to-merge snapshot (keeps its genesis and validators)
+// - Extracts all mainnet accounts EXCEPT vote and stake accounts
+// - Copies those mainnet accounts into the ledger-to-merge bank
 //
-// Result: Mainnet state with validators from the ledger to merge
+// Result: Ledger-to-merge's genesis and validators + mainnet's state (excluding mainnet validators)
 
 use {
     clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg},
@@ -40,10 +40,10 @@ use snapshot_merger::merge::functions;
 #[derive(Debug)]
 struct MergeStats {
     mainnet_total_accounts: usize,
-    mainnet_vote_accounts_removed: usize,
-    mainnet_stake_accounts_removed: usize,
-    merge_vote_accounts_added: usize,
-    merge_stake_accounts_added: usize,
+    merge_total_accounts: usize,
+    mainnet_vote_accounts_excluded: usize,
+    mainnet_stake_accounts_excluded: usize,
+    mainnet_accounts_copied: usize,
     final_total_accounts: usize,
     capitalization_before: u64,
     capitalization_after: u64,
@@ -157,49 +157,71 @@ fn merge_snapshots(
     info!("Ledger to merge: {:?}", ledger_to_merge);
     info!("Output directory: {:?}", output_snapshot_dir);
 
-    // Load genesis config from mainnet (we want mainnet's genesis)
-    info!("\n=== Step 1: Loading Genesis Config ===");
-    let genesis_config = open_genesis_config(mainnet_ledger, 10485760)
+    // Load genesis configs
+    info!("\n=== Step 1: Loading Genesis Configs ===");
+    let mainnet_genesis_config = open_genesis_config(mainnet_ledger, 10485760)
         .map_err(|e| format!("Failed to open mainnet genesis config: {:?}", e))?;
-    info!("Loaded genesis config successfully");
+    let merge_genesis_config = open_genesis_config(ledger_to_merge, 10485760)
+        .map_err(|e| format!("Failed to open ledger genesis config: {:?}", e))?;
+    info!("Loaded both genesis configs successfully");
 
     // Load mainnet snapshot
     info!("\n=== Step 2: Loading Mainnet Snapshot ===");
-    let mainnet_bank = load_bank_from_snapshot(mainnet_ledger, &genesis_config)?;
+    let mainnet_bank = load_bank_from_snapshot(mainnet_ledger, &mainnet_genesis_config)?;
     let mainnet_total_accounts = functions::count_total_accounts(&mainnet_bank)?;
     info!("Mainnet bank loaded with {} total accounts", mainnet_total_accounts);
 
-    // Load snapshot to merge (with its own genesis - we just need the accounts)
+    // Load merge ledger snapshot (this will be our base)
     info!("\n=== Step 3: Loading Ledger to Merge ===");
-    let merge_genesis_config = open_genesis_config(ledger_to_merge, 10485760)
-        .map_err(|e| format!("Failed to open ledger genesis config: {:?}", e))?;
     let merge_bank = load_bank_from_snapshot(ledger_to_merge, &merge_genesis_config)?;
+    let merge_total_accounts = functions::count_total_accounts(&merge_bank)?;
+    info!("Merge ledger loaded with {} total accounts", merge_total_accounts);
 
-    // Extract vote and stake accounts from ledger to merge
-    info!("\n=== Step 4: Extracting Validators to Merge ===");
-    let merge_vote_accounts = functions::extract_vote_accounts(&merge_bank)?;
-    let merge_stake_accounts = functions::extract_stake_accounts(&merge_bank)?;
+    // Extract mainnet vote and stake accounts (to filter them out)
+    info!("\n=== Step 4: Extracting Mainnet Validators (to exclude) ===");
+    let mainnet_vote_accounts = functions::extract_vote_accounts(&mainnet_bank)?;
+    let mainnet_stake_accounts = functions::extract_stake_accounts(&mainnet_bank)?;
+    info!("Found {} vote and {} stake accounts in mainnet to exclude",
+          mainnet_vote_accounts.len(), mainnet_stake_accounts.len());
 
-    // Create child bank from mainnet for modifications
-    info!("\n=== Step 5: Creating Child Bank for Modifications ===");
+    // Get ALL mainnet accounts and filter out vote/stake
+    info!("\n=== Step 5: Extracting Mainnet Accounts (excluding validators) ===");
+    let all_mainnet_accounts = mainnet_bank.get_all_accounts(false)
+        .map_err(|e| format!("Failed to get all mainnet accounts: {:?}", e))?;
+
+    let mut mainnet_accounts_to_copy = std::collections::HashMap::new();
+    let mut filtered_vote_count = 0;
+    let mut filtered_stake_count = 0;
+
+    for (pubkey, account, _slot) in all_mainnet_accounts {
+        if mainnet_vote_accounts.contains_key(&pubkey) {
+            filtered_vote_count += 1;
+            continue;
+        }
+        if mainnet_stake_accounts.contains_key(&pubkey) {
+            filtered_stake_count += 1;
+            continue;
+        }
+        mainnet_accounts_to_copy.insert(pubkey, account);
+    }
+
+    info!("Prepared {} mainnet accounts to copy (excluded {} vote, {} stake accounts)",
+          mainnet_accounts_to_copy.len(), filtered_vote_count, filtered_stake_count);
+
+    // Create child bank from merge ledger (this keeps merge ledger genesis and validators)
+    info!("\n=== Step 6: Creating Child Bank from Merge Ledger ===");
     let merged_bank = Bank::new_from_parent(
-        mainnet_bank.clone(),
-        mainnet_bank.collector_id(),
-        mainnet_bank.slot() + 1,
+        merge_bank.clone(),
+        merge_bank.collector_id(),
+        merge_bank.slot() + 1,
     );
     info!("Created child bank at slot {}", merged_bank.slot());
 
     let capitalization_before = merged_bank.capitalization();
 
-    // Remove mainnet vote and stake accounts
-    info!("\n=== Step 6: Removing Mainnet Validators ===");
-    let mainnet_vote_accounts_removed = functions::remove_vote_accounts(&merged_bank)?;
-    let mainnet_stake_accounts_removed = functions::remove_stake_accounts(&merged_bank)?;
-
-    // Add vote and stake accounts from ledger to merge
-    info!("\n=== Step 7: Adding Validators from Ledger to Merge ===");
-    functions::add_accounts(&merged_bank, &merge_vote_accounts, "vote")?;
-    functions::add_accounts(&merged_bank, &merge_stake_accounts, "stake")?;
+    // Add all non-validator accounts from mainnet
+    info!("\n=== Step 7: Adding Mainnet Accounts (excluding validators) ===");
+    functions::add_accounts(&merged_bank, &mainnet_accounts_to_copy, "mainnet")?;
 
     // Recalculate capitalization
     info!("\n=== Step 8: Recalculating Capitalization ===");
@@ -239,12 +261,21 @@ fn merge_snapshots(
 
     let snapshot_path = create_snapshot_from_bank(&final_bank, output_snapshot_dir)?;
 
+    // Write the merge ledger genesis config to the output directory
+    info!("Writing merge ledger genesis config to output directory...");
+    let genesis_path = output_snapshot_dir.join("genesis.bin");
+    let genesis_file = std::fs::File::create(&genesis_path)
+        .map_err(|e| format!("Failed to create genesis file: {:?}", e))?;
+    bincode::serialize_into(genesis_file, &merge_genesis_config)
+        .map_err(|e| format!("Failed to serialize genesis config: {:?}", e))?;
+    info!("Genesis config saved to: {:?}", genesis_path);
+
     let stats = MergeStats {
         mainnet_total_accounts,
-        mainnet_vote_accounts_removed,
-        mainnet_stake_accounts_removed,
-        merge_vote_accounts_added: merge_vote_accounts.len(),
-        merge_stake_accounts_added: merge_stake_accounts.len(),
+        merge_total_accounts,
+        mainnet_vote_accounts_excluded: filtered_vote_count,
+        mainnet_stake_accounts_excluded: filtered_stake_count,
+        mainnet_accounts_copied: mainnet_accounts_to_copy.len(),
         final_total_accounts,
         capitalization_before,
         capitalization_after,
@@ -254,10 +285,10 @@ fn merge_snapshots(
     info!("\n=== Merge Complete ===");
     info!("Statistics:");
     info!("  Mainnet total accounts: {}", stats.mainnet_total_accounts);
-    info!("  Mainnet vote accounts removed: {}", stats.mainnet_vote_accounts_removed);
-    info!("  Mainnet stake accounts removed: {}", stats.mainnet_stake_accounts_removed);
-    info!("  Vote accounts added from ledger to merge: {}", stats.merge_vote_accounts_added);
-    info!("  Stake accounts added from ledger to merge: {}", stats.merge_stake_accounts_added);
+    info!("  Merge ledger total accounts: {}", stats.merge_total_accounts);
+    info!("  Mainnet vote accounts excluded: {}", stats.mainnet_vote_accounts_excluded);
+    info!("  Mainnet stake accounts excluded: {}", stats.mainnet_stake_accounts_excluded);
+    info!("  Mainnet accounts copied: {}", stats.mainnet_accounts_copied);
     info!("  Final total accounts: {}", stats.final_total_accounts);
     info!("  Capitalization before: {} lamports", stats.capitalization_before);
     info!("  Capitalization after: {} lamports", stats.capitalization_after);
@@ -316,19 +347,19 @@ fn main() {
         Ok(stats) => {
             println!("\n✅ Snapshot merge completed successfully!");
             println!("\nSummary:");
-            println!("  • Started with {} mainnet accounts", stats.mainnet_total_accounts);
-            println!("  • Removed {} vote accounts and {} stake accounts from mainnet",
-                     stats.mainnet_vote_accounts_removed,
-                     stats.mainnet_stake_accounts_removed);
-            println!("  • Added {} vote accounts and {} stake accounts from ledger to merge",
-                     stats.merge_vote_accounts_added,
-                     stats.merge_stake_accounts_added);
+            println!("  • Started with {} accounts from merge ledger", stats.merge_total_accounts);
+            println!("  • Mainnet had {} total accounts", stats.mainnet_total_accounts);
+            println!("  • Excluded {} vote accounts and {} stake accounts from mainnet",
+                     stats.mainnet_vote_accounts_excluded,
+                     stats.mainnet_stake_accounts_excluded);
+            println!("  • Copied {} mainnet accounts to merge ledger",
+                     stats.mainnet_accounts_copied);
             println!("  • Final snapshot has {} accounts", stats.final_total_accounts);
             println!("  • Capitalization: {} -> {} lamports",
                      stats.capitalization_before,
                      stats.capitalization_after);
             println!("\nSnapshot archive created: {}", stats.snapshot_path);
-            println!("You can use this snapshot to start a validator with the merged state.");
+            println!("Result: Merge ledger validators + mainnet state (excluding mainnet validators)");
         }
         Err(e) => {
             eprintln!("❌ Error: {}", e);

@@ -80,6 +80,7 @@ pub mod functions {
         Ok(())
     }
 
+    /// Counts total accounts in the bank
     pub fn count_total_accounts(bank: &Bank) -> Result<usize, String> {
         let mut count = 0;
         bank.scan_all_accounts(|_| { count += 1; }, true)
