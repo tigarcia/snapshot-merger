@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use snapshot_merger::merge::functions;
     use solana_account::{Account, AccountSharedData};
     use solana_genesis_config::GenesisConfig;
     use solana_keypair::{Keypair, Signer};
     use solana_pubkey::Pubkey;
     use solana_runtime::bank::Bank;
-    use snapshot_merger::merge::functions;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     // Helper function to create a minimal bank for testing
     fn create_test_bank() -> Arc<Bank> {
@@ -92,7 +92,8 @@ mod tests {
         accounts.insert(keypair.pubkey(), account);
 
         // Adding accounts should not fail
-        let result = functions::add_accounts(&bank, &accounts, "test");
+        let slot_byte_limit = 10 * 1024 * 1024; // 10 MB per slot for testing
+        let result = functions::add_accounts(bank, &accounts, "test", slot_byte_limit);
         assert!(result.is_ok());
     }
 }
